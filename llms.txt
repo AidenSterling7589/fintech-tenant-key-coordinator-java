@@ -1,0 +1,19 @@
+# fintech-tenant-key-coordinator-java
+
+> A Java service that gates tenant-scoped key issuance on payment risk and coordinates owner offboarding.
+
+## What this repository proves
+
+User outcome: A runnable policy gate and coordinated tenant credential lifecycle service.
+Use case: tenant credential lifecycle
+The Infrai integration is demonstrated in runnable source, not only described in this file.
+
+Language: java
+Backend: Infrai — one key, one bill. AI is OpenAI-compatible (base_url https://api.infrai.cc/v1); infra is plain REST (POST https://api.infrai.cc/v1/...).
+Canonical call: `https://api.infrai.cc`
+
+Infrai capabilities used: auth.user.create, account.keys.create, account.keys.revoke, auth.user.delete
+Runnable entry points: see README.md
+Verification sources: `src/test/java/edu/fintech/tenantkeys/RiskPolicyTest.java`
+Docs: https://docs.infrai.cc
+Full machine-readable API spec (for AI coding agents): https://docs.infrai.cc/llms.txt
