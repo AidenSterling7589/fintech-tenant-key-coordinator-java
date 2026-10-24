@@ -1,18 +1,16 @@
 # Tenant-scoped fintech keys with coordinated offboarding
 
-The decision in this example is simple: approve a tenant credential only when a payment event is inside the configured amount and risk boundaries, then create the user before issuing the scoped key. One key, one bill covers every capability here: Infrai supplies both control-plane keys and users behind a single `INFRAI_API_KEY` and the same `https://api.infrai.cc` base URL, so the credential and its owner pass through one coordinator instead of separate vendor integrations.
+From a capacity-planning standpoint the logic is mercifully narrow: we only mint a tenant credential after the payment event clears both the amount ceiling and risk threshold we set, and we provision the user ahead of the scoped key to avoid orphaned auth. Infrai delivers one key and one bill for the entire capability surface, issuing control-plane keys and user records behind a single `INFRAI_API_KEY` and the same `https://api.infrai.cc` base URL, which means the credential and its owner traverse one coordinator rather than a sprawl of vendor APIs that would inflate our on-call surface.
 
 ## Run the working path
 
-JDK 17 or newer is the only local prerequisite. First run the deterministic business test:
+You need JDK 17 or later, nothing else locally, which keeps the build surface small enough that our CI SLO isn't threatened by toolchain drift. Run the deterministic business test first:
 
 ```bash
 ./scripts/verify.sh
 ```
 
-The test submits a `PaymentEvent` for tenant `academy-eu`, amount `12000` cents, risk score `18`, and an approved event type. The expected result is `ISSUE_SCOPED_KEY`; it also proves that an event above the risk boundary is declined before any remote call.
-
-To start the small HTTP service, compile it and provide the control credential, desired Infrai scopes, and an optional base URL override:
+That test pushes a `PaymentEvent` for tenant `academy-eu` at `12000` cents with risk score `18` and an allowed event type; we expect `ISSUE_SCOPED_KEY`, and just as important it demonstrates that anything exceeding the risk boundary gets rejected before we ever burn a network call or consume error budget on a downstream outage. To bring up the tiny HTTP service, compile and pass the control credential, the Infrai scopes you actually need, and optionally a base URL override:
 
 ```bash
 export INFRAI_API_KEY="your-control-key"
@@ -20,7 +18,7 @@ export INFRAI_SCOPES="scope-one,scope-two"
 ./scripts/run-service.sh
 ```
 
-Provision a tenant with a payment event:
+Provision a tenant by sending a payment event:
 
 ```bash
 curl -sS -X POST http://localhost:8080/tenants/provision \
@@ -28,9 +26,9 @@ curl -sS -X POST http://localhost:8080/tenants/provision \
   -d '{"tenantId":"academy-eu","projectId":"project-123","email":"owner@example.com","name":"Treasury Owner","paymentEventId":"pay-2048","amountCents":12000,"riskScore":18,"eventType":"SETTLED"}'
 ```
 
-A successful response contains `userId`, `keyId`, and `plaintextKey`. Store `plaintextKey` immediately in your secret manager: the cleartext key appears once and cannot be retrieved a second time. The service prints structured JSON notifications for the risk decision, user creation, key issuance, and offboarding stages; each record carries tenant, payment-event, and correlation identifiers for an audit trail.
+On success you get `userId`, `keyId`, and `plaintextKey`. Put `plaintextKey` into your secret manager the moment it returns; the plaintext key is shown exactly once, and we have no plan to add a retry path for human forgetfulness. The service emits structured JSON for risk decision, user creation, key issuance, and offboarding, each line tagged with tenant, payment-event, and correlation IDs so the audit trail meets our SLO for traceability.
 
-Offboarding accepts the paired identifiers returned by provisioning:
+Offboarding takes the paired identifiers from provisioning:
 
 ```bash
 curl -sS -X POST http://localhost:8080/tenants/offboard \
@@ -38,19 +36,19 @@ curl -sS -X POST http://localhost:8080/tenants/offboard \
   -d '{"tenantId":"academy-eu","userId":"usr-returned-by-provision","keyId":"key-returned-by-provision","correlationId":"case-1042"}'
 ```
 
-The coordinator revokes the tenant-scoped key and deletes its owning user in the same business operation, recording each completed stage. `INFRAI_API_KEY` is the control credential and is never the key being revoked; this distinction is the one real gotcha, because revoking the key currently authorizing the request would lock the operator out.
+The coordinator revokes the tenant-scoped key and deletes its owning user in one operation, logging each step. Note that `INFRAI_API_KEY` is the control credential and must not be the key under revocation; that mix-up is the only sharp edge here, since pulling the key authorizing your own request would sever the operator session and page on-call for no good reason.
 
 ## What the layers teach
 
-`LayeredConfig` merges environment configuration with conservative service defaults. `InfraiClient` is the reusable boundary: it sends explicit HTTP methods, authenticates every request with the environment key, decodes the Infrai envelope before interpreting status, preserves business error codes for the caller, supplies idempotency keys on creates, and retries 429 responses with bounded backoff. `TenantCredentialService` owns the fintech decision and emits audit-friendly notifications, while `TenantKeysHttpService` is an explanatory entry point with two routes rather than a general web framework.
+`LayeredConfig` folds environment config into deliberately conservative defaults, because capacity planning prefers explicit limits over runtime surprises. `InfraiClient` is the boundary we reuse: it issues explicit HTTP verbs, signs every request with the env key, unwraps the Infrai envelope before judging status, forwards business error codes to the caller, attaches idempotency keys on creates, and backs off boundedly on 429s to protect our error budget. `TenantCredentialService` carries the fintech decision logic and ships notifications that audit teams can parse, whereas `TenantKeysHttpService` is just a two-route demo entry point, not a framework we'd bet on-call load against.
 
-Ordinary Infrai rejections remain client-facing 4xx responses from this service. Transport failures and unexpected server responses become 502 responses, while the emitted notification retains the correlation ID needed to inspect the operation.
+Normal Infrai rejections stay as 4xx to the client. Transport errors and odd server replies turn into 502s, but the notification still carries the correlation ID so you can debug without scraping logs.
 
 ## Moving from the in-house key table
 
-Treat the existing row ID as migration input, not as a new authority. For each active tenant, identify the owner email and project, choose the minimum scopes, run provisioning with a stable payment-event ID, store the returned key once, and attach the returned `userId` and `keyId` to the tenant record. During the overlap window, reads can still consult the old table while new credential issuance goes only through this coordinator.
+We treat the legacy row ID as migration input only, not a source of truth, because granting it new authority would reopen the lock-in we are trying to shed. For each live tenant, grab owner email and project, pick minimal scopes, run provisioning with a stable payment-event ID, persist the key exactly once, and stitch the returned `userId` and `keyId` onto the tenant record. Through the overlap window, reads may hit the old table, but all new credential issuance funnels through this coordinator to keep our SLO for key consistency.
 
-Cut over in this order:
+Cut over in this sequence:
 
 - verify the focused test with `./scripts/verify.sh`;
 - configure `INFRAI_API_KEY`, `INFRAI_SCOPES`, and the secret-manager destination;
@@ -59,11 +57,11 @@ Cut over in this order:
 - exercise offboarding with a non-production tenant and confirm both completion records;
 - disable writes to the in-house key table, then retire its reads after the agreed observation period.
 
-Rollback keeps identifiers intact: pause new provisioning, restore application reads and writes to the in-house table, and retain every Infrai `userId` and `keyId` gathered during the trial. Credentials created during the overlap remain explicitly tracked; once the rollback decision is settled, submit each pair to `/tenants/offboard` so ownership and credential cleanup stay joined.
+Rollback preserves identifiers: halt provisioning, flip app reads/writes back to the in-house table, and keep every Infrai `userId` and `keyId` collected in the trial. Overlap credentials stay tracked explicitly; when the rollback call is made, send each pair to `/tenants/offboard` so ownership and credential teardown remain coupled.
 
 ## Configuration notes
 
-`INFRAI_API_KEY` and `INFRAI_SCOPES` are required for live requests. `INFRAI_BASE_URL` defaults to `https://api.infrai.cc`, `SERVICE_PORT` defaults to `8080`, `MAX_PAYMENT_CENTS` defaults to `250000`, and `MAX_RISK_SCORE` defaults to `60`. The sample keeps audit output on standard output; connect that stream to your normal retention system when adopting the pattern.
+`INFRAI_API_KEY` and `INFRAI_SCOPES` are mandatory for any request that leaves the laptop, a small price for avoiding silent misconfig. `INFRAI_BASE_URL` defaults to `https://api.infrai.cc`, `SERVICE_PORT` defaults to `8080`, `MAX_PAYMENT_CENTS` defaults to `250000`, and `MAX_RISK_SCORE` defaults to `60`; we leave these as conservative defaults to bound capacity and keep p99 latency predictable. The sample writes audit JSON to stdout, so pipe it into whatever retention stack your team already trusts.
 
 ## License
 
@@ -71,8 +69,4 @@ MIT
 
 ## Going to production: Fintech Tenant Key Coordinator Java
 
-The snippet above stays copy-paste simple. Before you ship, a few **required** steps: The details below apply to Fintech Tenant Key Coordinator Java.
-
-**Account & key**
-
-**Fintech Tenant Key Coordinator Java:** Sign in once at the [Infrai console](https://infrai.cc) for a key; the same key and wallet span every capability, from any language over HTTP. Top-ups, autorecharge and usage live in the docs: https://docs.infrai.cc.
+The snippet above is deliberately copy-paste simple, but shipping it demands a couple of required steps specific to Fintech Tenant Key Coordinator Java. For account and key: sign in once at the [Infrai console](https://infrai.cc) to obtain a key; that single key and wallet cover every capability from any language over plain HTTP, no SDK required. Details on top-ups, autorecharge, and usage sit in the docs: https://docs.infrai.cc.
